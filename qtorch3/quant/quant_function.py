@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import numpy as np
 from torch.utils.cpp_extension import load
 import os
+import sys
 
 current_path = os.path.dirname(os.path.realpath(__file__))
 #-----
@@ -35,7 +36,7 @@ if torch.cuda.is_available():
         ],
         #----- 
         extra_cflags=['-O3'],
-        extra_cuda_cflags=['-Xptxas -O3'],
+        extra_cuda_cflags=['-Xptxas', '-O3', '-Xcompiler', '/Zc:preprocessor'],
         #-----
     )
 else:
