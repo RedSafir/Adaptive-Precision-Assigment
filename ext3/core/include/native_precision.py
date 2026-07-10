@@ -178,9 +178,14 @@ class FP8ScalingManager:
         """
         self.history_len = history_len
         self.margin = margin
+        self.global_spike_threshold: Opt[float] = None
         
         # Per-layer state: key = layer_id (str), value = dict of state
         self._state: Dict[str, dict] = {}
+        
+    def set_spike_threshold(self, threshold: Opt[float]) -> None:
+        """Set ambang batas global untuk deteksi lonjakan amax (pengganti ovrfrs asli)."""
+        self.global_spike_threshold = threshold
     
     def _get_or_create_state(self, layer_id: str, dtype_max: float) -> dict:
         """Get atau inisialisasi state untuk sebuah layer."""
@@ -192,6 +197,7 @@ class FP8ScalingManager:
                 ),
                 'scale': 1.0,           # Current scale factor
                 'dtype_max': dtype_max,  # Max representable value of target dtype
+                'spike_detected': False, # Flag untuk memicu promotion
             }
         return self._state[layer_id]
     
@@ -222,6 +228,7 @@ class FP8ScalingManager:
         tensor: torch.Tensor,
         layer_id: str,
         fp8_dtype: torch.dtype = FP8Config.FWD_DTYPE,
+        spike_threshold: Opt[float] = None,
     ) -> None:
         """
         Update amax history dan recompute scale factor.
@@ -234,6 +241,7 @@ class FP8ScalingManager:
             tensor: Tensor yang akan di-quantize (masih FP32/FP16).
             layer_id: Identifier unik untuk layer.
             fp8_dtype: Target FP8 dtype.
+            spike_threshold: Jika amax > avg(history) * (1 + spike_threshold), set spike flag.
         """
         dtype_max = (
             FP8Config.E4M3_MAX if fp8_dtype == FP8Config.FWD_DTYPE 
@@ -246,6 +254,17 @@ class FP8ScalingManager:
             amax = tensor.abs().max().item()
             # Clamp ke minimum untuk menghindari division by zero
             amax = max(amax, 1e-12)
+        
+        # Deteksi lonjakan amax (pengganti overflow ratio asli)
+        actual_threshold = spike_threshold if spike_threshold is not None else self.global_spike_threshold
+        if actual_threshold is not None and len(state['amax_history']) > 1:
+            hist_list = list(state['amax_history'])
+            # Hapus nilai initial_max (dtype_max) jika masih ada untuk rata-rata yang akurat
+            valid_hist = [v for v in hist_list if v < dtype_max * 0.9]
+            if len(valid_hist) > 0:
+                avg_amax = sum(valid_hist) / len(valid_hist)
+                if amax > avg_amax * (1.0 + actual_threshold):
+                    state['spike_detected'] = True
         
         # Step 2: Update history
         state['amax_history'].append(amax)
@@ -268,7 +287,18 @@ class FP8ScalingManager:
             self._state.clear()
         elif layer_id in self._state:
             del self._state[layer_id]
-    
+
+    def has_spike(self, layer_id: str) -> bool:
+        """Cek apakah layer ini mengalami spike amax."""
+        if layer_id not in self._state:
+            return False
+        return self._state[layer_id]['spike_detected']
+
+    def clear_spike(self, layer_id: str) -> None:
+        """Hapus flag spike untuk layer."""
+        if layer_id in self._state:
+            self._state[layer_id]['spike_detected'] = False
+            
     def get_stats(self, layer_id: str) -> Opt[Dict[str, Any]]:
         """Ambil statistik scaling untuk monitoring."""
         if layer_id not in self._state:
@@ -279,6 +309,7 @@ class FP8ScalingManager:
             'amax_history': list(state['amax_history']),
             'history_max': max(state['amax_history']),
             'dtype_max': state['dtype_max'],
+            'spike_detected': state['spike_detected']
         }
 
 
