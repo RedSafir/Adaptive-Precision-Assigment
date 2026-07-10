@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 import random
 
-from ext3.nn.nn_native import NativeConv2d, NativeLinear, get_fp8_manager
 from ext3.core.include.native_precision import NativePrecisionMode
 
 __all__ = ['NativePasn']
@@ -35,6 +34,7 @@ class NativePasn:
         """
         self.layers = []
         self.group_sizes = []
+        from ext3.nn.nn_native import NativeConv2d, NativeLinear
         for name, module in self.model.named_modules():
             if isinstance(module, (NativeConv2d, NativeLinear)):
                 self.layers.append(module)
@@ -137,6 +137,7 @@ class NativePasn:
         Returns:
             Jumlah layer yang berhasil di-promote pada iterasi ini.
         """
+        from ext3.nn.nn_native import get_fp8_manager
         manager = get_fp8_manager()
         promoted_count = 0
         
