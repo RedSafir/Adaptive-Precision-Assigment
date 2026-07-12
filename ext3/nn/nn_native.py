@@ -21,6 +21,7 @@ from ext3.core.include.native_precision import (
     fp8_cast_forward,
 )
 from ext3.core import EModl
+from ext3.core.include import Ttype
 
 import torch
 import torch.nn as nn
@@ -136,21 +137,29 @@ class NativePrecisionMixin:
         Returns:
             Output tensor.
         """
-        mode = self._native_mode
+        native_mode_obj = None
+        # Gunakan dynamic precision dari Pasn/EModl jika tersedia
+        if hasattr(self, 'info_ts') and hasattr(self.info_ts[Ttype.Y], 'dtype') and len(self.info_ts[Ttype.Y].dtype) > 0:
+            target_dtype = self.info_ts[Ttype.Y].dtype[0]
+            if hasattr(target_dtype, 'to_native'):
+                native_mode_obj = target_dtype.to_native().mode_name
+                
+        # Fallback ke static mode jika disetel secara manual
+        mode = native_mode_obj if native_mode_obj is not None else (self._native_mode.value if self._native_mode else None)
         
-        if mode is None or mode == NativePrecisionMode.BASE_TF32:
+        if mode is None or mode == NativePrecisionMode.BASE_TF32.value:
             # ---- TF32 Mode ----
             # Tidak perlu wrapper apapun.
             # TF32 aktif secara global via torch.backends.cuda.matmul.allow_tf32
             return original_forward_fn(*args, **kwargs)
         
-        elif mode == NativePrecisionMode.BASE_FP16:
+        elif mode == NativePrecisionMode.BASE_FP16.value:
             # ---- FP16 Mode ----
             # Bungkus komputasi dengan autocast FP16
             with torch.cuda.amp.autocast(dtype=torch.float16):
                 return original_forward_fn(*args, **kwargs)
         
-        elif mode == NativePrecisionMode.LOW_FP8:
+        elif mode == NativePrecisionMode.LOW_FP8.value:
             # ---- FP8 Mode ----
             return self._fp8_forward(original_forward_fn, *args, **kwargs)
         
@@ -200,6 +209,12 @@ class NativePrecisionMixin:
         
         # Update amax SEBELUM casting (gunakan nilai FP32 asli)
         manager.update_amax(x, fwd_uid, FP8Config.FWD_DTYPE)
+        
+        # Inject overflow_count into undovr for Pasn Tracking
+        if hasattr(self, 'info_ts') and hasattr(self.info_ts[Ttype.Y], 'undovr') and len(self.info_ts[Ttype.Y].undovr) > 0:
+            with torch.no_grad():
+                overflow_count = (x.abs() > FP8Config.E4M3_MAX).sum().float()
+                self.info_ts[Ttype.Y].undovr[0] = torch.tensor([0.0, overflow_count], device=x.device)
         
         # Cast to FP8 → immediately dequantize back
         # Ini mensimulasikan efek precision loss dari FP8
@@ -251,7 +266,7 @@ class NativePrecisionMixin:
 # Layer yang memiliki weight (Conv2d, Linear) → mendapat full FP8 support
 # Layer tanpa weight (ReLU, Pooling, BN) → hanya TF32/FP16 support
 
-class NativeConv2d(nn.Conv2d, EModl, NativePrecisionMixin):
+class NativeConv2d(NativePrecisionMixin, nn.Conv2d, EModl):
     """
     Conv2d dengan native hardware precision support.
     
@@ -272,12 +287,10 @@ class NativeConv2d(nn.Conv2d, EModl, NativePrecisionMixin):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass dengan precision dispatch."""
-        if self._native_mode is not None:
-            return self._native_forward_wrapper(
-                self._conv_forward_native, x
-            )
-        # Fallback ke parent EModl forward (yang memiliki hooks)
-        return super(NativeConv2d, self).forward(x)
+        out = self._native_forward_wrapper(
+            self._conv_forward_native, x
+        )
+        return out
     
     def _conv_forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """Execute conv2d operation."""
@@ -287,7 +300,7 @@ class NativeConv2d(nn.Conv2d, EModl, NativePrecisionMixin):
         )
 
 
-class NativeLinear(nn.Linear, EModl, NativePrecisionMixin):
+class NativeLinear(NativePrecisionMixin, nn.Linear, EModl):
     """
     Linear layer dengan native hardware precision support.
     
@@ -307,11 +320,10 @@ class NativeLinear(nn.Linear, EModl, NativePrecisionMixin):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass dengan precision dispatch."""
-        if self._native_mode is not None:
-            return self._native_forward_wrapper(
-                self._linear_forward_native, x
-            )
-        return super(NativeLinear, self).forward(x)
+        out = self._native_forward_wrapper(
+            self._linear_forward_native, x
+        )
+        return out
     
     def _linear_forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """Execute linear operation."""
