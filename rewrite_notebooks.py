@@ -103,7 +103,7 @@ def assign_precision(model: nn.Module, config: dict) -> Pasn:
     
     # 2. Topological Mapping (Dummy forward)
     def new_id_grp_all(emodl):
-        return True # Setiap layer jadi grup terpisah
+        return isinstance(emodl, (NativeConv2d, NativeLinear))
         
     EModlObjMgr.set_info_mdcur_id(new_id_grp_all)
     EModlObjMgr.reset_info(True)
@@ -428,7 +428,7 @@ def assign_precision(model: nn.Module, config: dict) -> Pasn:
     EModlObjMgr.register(model)
     
     def new_id_grp_all(emodl):
-        return True
+        return isinstance(emodl, (NativeConv2d, NativeLinear))
         
     EModlObjMgr.set_info_mdcur_id(new_id_grp_all)
     EModlObjMgr.reset_info(True)
