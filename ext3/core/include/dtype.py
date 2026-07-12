@@ -299,14 +299,19 @@ class Dtype():
         exp_bias = dtype._get_exp_bias(t, reset_cur_exp_bias)
 
         # calc: {under,over}flow ratio.
-        undovr_ratio = qtorch3.quant.ratio_abs_leq_geq_thrs(t, 
+        is_half = (t.dtype == torch.float16)
+        t_for_qtorch = t.float() if is_half else t
+        
+        undovr_ratio = qtorch3.quant.ratio_abs_leq_geq_thrs(t_for_qtorch, 
                                                             thrs_l=dtype.undfl_thrs * (2**-exp_bias),
                                                             thrs_g=dtype.ovrfl_thrs * (2**-exp_bias),)
         emodl.info_ts[ttype].undovr[i] = undovr_ratio
 
         # round: t.
-        res = qtorch3.quant.float_quantize_custom(t, exp=dtype.fmt.exp, man=dtype.fmt.man,
+        res = qtorch3.quant.float_quantize_custom(t_for_qtorch, exp=dtype.fmt.exp, man=dtype.fmt.man,
                                                   exp_bias_pow=2**exp_bias, allow_inf=allow_inf)
+        if is_half:
+            res = res.half()
         return res
 
     # round with rndmd.
@@ -325,13 +330,18 @@ class Dtype():
         exp_bias = rndmd.dtype._get_exp_bias(t, reset_cur_exp_bias)
 
         # calc: {under,over}flow ratio.
-        undovr_ratio = qtorch3.quant.ratio_abs_leq_geq_thrs(t, 
+        is_half = (t.dtype == torch.float16)
+        t_for_qtorch = t.float() if is_half else t
+        
+        undovr_ratio = qtorch3.quant.ratio_abs_leq_geq_thrs(t_for_qtorch, 
                                                             thrs_l=rndmd.dtype.undfl_thrs * (2**-exp_bias),
                                                             thrs_g=rndmd.dtype.ovrfl_thrs * (2**-exp_bias),)
         emodl.info_ts[ttype].undovr[i] = undovr_ratio
 
         # round: t.
-        res = rndmd(t, exp_bias_pow=2**exp_bias, allow_inf=allow_inf)
+        res = rndmd(t_for_qtorch, exp_bias_pow=2**exp_bias, allow_inf=allow_inf)
+        if is_half:
+            res = res.half()
         return res
 
 #==============#
