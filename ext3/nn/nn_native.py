@@ -20,7 +20,7 @@ from ext3.core.include.native_precision import (
     check_fp8_support,
     fp8_cast_forward,
 )
-from ext3.core import EModl
+from ext3.core import EModl, EFuncMgr
 from ext3.core.include import Ttype
 
 import torch
@@ -38,7 +38,17 @@ __all__ = [
     'NativeMaxPool2d',
     'NativeAdaptiveAvgPool2d',
     'NativeDropout',
+    'flatten',
+    'permute',
+    'reshape',
+    'view',
 ]
+
+# functional wrappers to keep graph tracking alive
+flatten: Callable = EFuncMgr.gen(torch.flatten)
+permute: Callable = EFuncMgr.gen(torch.Tensor.permute)
+reshape: Callable = EFuncMgr.gen(torch.Tensor.reshape)
+view: Callable = EFuncMgr.gen(torch.Tensor.view)
 
 # ============================================================
 # Global FP8 Scaling Manager (shared across all layers)
