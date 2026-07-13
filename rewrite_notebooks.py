@@ -101,9 +101,23 @@ def assign_precision(model: nn.Module, config: dict) -> Pasn:
     EModlObjMgr.unregister_all()
     EModlObjMgr.register(model)
     
-    # 2. Topological Mapping (Dummy forward)
+    # 2. Block-Based Tensor Grouping (matching wonyeol new_id_grp_all)
+    #    - NativeLinear → selalu new group, reset tracking
+    #    - NativeConv2d → new group HANYA jika in_channels berubah
+    #    - Lainnya (BN, ReLU, Pool) → inherit group sebelumnya
+    last_in_channels = None
     def new_id_grp_all(emodl):
-        return isinstance(emodl, (NativeConv2d, NativeLinear))
+        nonlocal last_in_channels
+        if isinstance(emodl, NativeLinear):
+            last_in_channels = None
+            return True
+        elif isinstance(emodl, NativeConv2d):
+            cur = emodl.in_channels
+            ret = (last_in_channels != cur)
+            last_in_channels = cur
+            return ret
+        else:
+            return False
         
     EModlObjMgr.set_info_mdcur_id(new_id_grp_all)
     EModlObjMgr.reset_info(True)
@@ -118,23 +132,27 @@ def assign_precision(model: nn.Module, config: dict) -> Pasn:
     
     pasn = Pasn(EModlObjMgr.get_emodls(), dtype_fwd=FP32)
     
-    # 4. Demotion logic (mirip asli)
+    # 4. Demotion logic (matching wonyeol: cur=Y+GY, prv=P+GP)
     target_ratio = config['pa_upd_rmin']
     
     # Pilih ID untuk demotion berdasarkan ukuran layer
     ids, r = EModlObjMgr.get_ids_chosen('grp_all', config['pa_upd_schm'], r_min=target_ratio)
     
     # Proteksi layer pertama dan terakhir
-    # Asumsikan ID grp_all secara berurutan sesuai eksekusi
     if len(ids) > 0:
         sorted_emodls = EModlObjMgr.get_emodls_sort()
         first_id = sorted_emodls[0].info_mdcur.id['grp_all']
         last_id = sorted_emodls[-1].info_mdcur.id['grp_all']
         ids = [i for i in ids if i != first_id and i != last_id]
     
-    # Update DtypePlan
-    upd_dtplan = {Ttype.Y: FP8}
-    pasn.update_by_id_grp_all('cur', 'id', upd_dtplan, [i.val for i in ids])
+    # Update DtypePlan — demote KEDUA topologi (aktivasi + parameter)
+    upd_idvals = [i.val for i in ids]
+    # Phase 1: Demote activations (cur node → Y, GY)
+    upd_dtplan_cur = {Ttype.Y: FP8, Ttype.GY: FP8}
+    pasn.update_by_id_grp_all('cur', 'id', upd_dtplan_cur, upd_idvals)
+    # Phase 2: Demote parameters (prv node → P, GP)
+    upd_dtplan_prv = {Ttype.P: FP8, Ttype.GP: FP8}
+    pasn.update_by_id_grp_all('prv', 'id', upd_dtplan_prv, upd_idvals)
     
     # Apply to Graph
     EModlObjMgr.set_info_ts_dtype(pasn)
@@ -146,10 +164,15 @@ def assign_precision(model: nn.Module, config: dict) -> Pasn:
     print("\\n=== Grouping & Demotion Map ===")
     for emodl in EModlObjMgr.get_emodls_sort():
         uid = emodl.info_mdcur.id['grp_all'].val
-        dtype = emodl.info_ts[Ttype.Y].dtype[0]
-        mode = dtype.to_native().mode_name
-        marker = " [DEMOTED]" if mode == "low_fp8" else ""
-        print(f"Layer ID {uid:3d} | {str(type(emodl)):40s} | {mode:10s}{marker}")
+        dtype_y = emodl.info_ts[Ttype.Y].dtype[0] if hasattr(emodl.info_ts[Ttype.Y], 'dtype') and len(emodl.info_ts[Ttype.Y].dtype) > 0 else FP32
+        dtype_p = emodl.info_ts[Ttype.P].dtype[0] if hasattr(emodl.info_ts[Ttype.P], 'dtype') and len(emodl.info_ts[Ttype.P].dtype) > 0 else FP32
+        mode_y = dtype_y.to_native().mode_name
+        mode_p = dtype_p.to_native().mode_name
+        markers = []
+        if mode_y == "low_fp8": markers.append("Y=FP8")
+        if mode_p == "low_fp8": markers.append("P=FP8")
+        marker_str = f" [DEMOTED: {', '.join(markers)}]" if markers else ""
+        print(f"Group {uid:3d} | {type(emodl).__qualname__:30s} | Y={mode_y:10s} P={mode_p:10s}{marker_str}")
     
     print("=" * 80)
     return pasn
@@ -166,7 +189,7 @@ print("assign_precision() defined ✓")
 # Cell 8: Training Function
 # ============================================================
 
-def train_epoch(model, loader, criterion, optimizer, device):
+def train_epoch(model, loader, criterion, optimizer, device, ovr_thrs=0.0):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
     
@@ -179,14 +202,16 @@ def train_epoch(model, loader, criterion, optimizer, device):
         loss.backward()
         optimizer.step()
         
-        # --- NATIVE APA: Precision Promotion ---
-        # 1. Ambil tensor undovr dari seluruh layer
+        # --- NATIVE APA: Precision Promotion (matching wonyeol) ---
+        # 1. Ambil overflow/underflow RATIO dari seluruh layer
         undovrs = EModlObjMgr.get_undovrs()
-        # 2. Check apakah ada overflow (indeks 1 dari tensor [underflow, overflow])
-        # Kita menggunakan Ttype.Y sesuai injeksi di NativeConv2d
-        overflow_counts = undovrs[Ttype.Y][:, 1] 
-        flag = overflow_counts > 0
-        # 3. Jika ada, lakukan promosi kembali ke FP32
+        # 2. Buat flag array: gabung P + Y (matching emodlobjmgr.inc_ts_prec order)
+        #    Format undovrs[ttype]: ndarray shape (N, 2) → kolom 0=underflow_ratio, 1=overflow_ratio
+        flag = np.concatenate([
+            undovrs[Ttype.P][:, 1] >= ovr_thrs,   # overflow ratio di parameter
+            undovrs[Ttype.Y][:, 1] >= ovr_thrs,   # overflow ratio di aktivasi
+        ])
+        # 3. Jika ada overflow, promosikan kembali ke FP32 (permanen)
         EModlObjMgr.inc_ts_prec(flag, {Ttype.Y: FP32, Ttype.P: FP32})
         
         total_loss += loss.item() * inputs.size(0)
@@ -195,7 +220,6 @@ def train_epoch(model, loader, criterion, optimizer, device):
         correct += predicted.eq(targets).sum().item()
     
     # Dapatkan jumlah promosi epoch ini
-    # inc_ts_prec_flag merekam flag promosi yang di-trigger selama training loop
     flags = EModlObjMgr.get_inc_ts_prec_flag()
     total_promotions = sum([1 for f in flags if f > 0.0])
     
@@ -427,8 +451,23 @@ def assign_precision(model: nn.Module, config: dict) -> Pasn:
     EModlObjMgr.unregister_all()
     EModlObjMgr.register(model)
     
+    # Block-Based Tensor Grouping (matching wonyeol new_id_grp_all)
+    #   - NativeLinear → selalu new group, reset tracking
+    #   - NativeConv2d → new group HANYA jika in_channels berubah
+    #   - Lainnya (BN, ReLU, Pool) → inherit group sebelumnya
+    last_in_channels = None
     def new_id_grp_all(emodl):
-        return isinstance(emodl, (NativeConv2d, NativeLinear))
+        nonlocal last_in_channels
+        if isinstance(emodl, NativeLinear):
+            last_in_channels = None
+            return True
+        elif isinstance(emodl, NativeConv2d):
+            cur = emodl.in_channels
+            ret = (last_in_channels != cur)
+            last_in_channels = cur
+            return ret
+        else:
+            return False
         
     EModlObjMgr.set_info_mdcur_id(new_id_grp_all)
     EModlObjMgr.reset_info(True)
@@ -444,14 +483,21 @@ def assign_precision(model: nn.Module, config: dict) -> Pasn:
     target_ratio = config['pa_upd_rmin']
     ids, r = EModlObjMgr.get_ids_chosen('grp_all', config['pa_upd_schm'], r_min=target_ratio)
     
+    # Proteksi layer pertama dan terakhir
     if len(ids) > 0:
         sorted_emodls = EModlObjMgr.get_emodls_sort()
         first_id = sorted_emodls[0].info_mdcur.id['grp_all']
         last_id = sorted_emodls[-1].info_mdcur.id['grp_all']
         ids = [i for i in ids if i != first_id and i != last_id]
     
-    upd_dtplan = {Ttype.Y: FP8}
-    pasn.update_by_id_grp_all('cur', 'id', upd_dtplan, [i.val for i in ids])
+    # Update DtypePlan — demote KEDUA topologi (aktivasi + parameter)
+    upd_idvals = [i.val for i in ids]
+    # Phase 1: Demote activations (cur node → Y, GY)
+    upd_dtplan_cur = {Ttype.Y: FP8, Ttype.GY: FP8}
+    pasn.update_by_id_grp_all('cur', 'id', upd_dtplan_cur, upd_idvals)
+    # Phase 2: Demote parameters (prv node → P, GP)
+    upd_dtplan_prv = {Ttype.P: FP8, Ttype.GP: FP8}
+    pasn.update_by_id_grp_all('prv', 'id', upd_dtplan_prv, upd_idvals)
     
     EModlObjMgr.set_info_ts_dtype(pasn)
     
@@ -462,10 +508,15 @@ def assign_precision(model: nn.Module, config: dict) -> Pasn:
     print("\\n=== Grouping & Demotion Map ===")
     for emodl in EModlObjMgr.get_emodls_sort():
         uid = emodl.info_mdcur.id['grp_all'].val
-        dtype = emodl.info_ts[Ttype.Y].dtype[0]
-        mode = dtype.to_native().mode_name
-        marker = " [DEMOTED]" if mode == "low_fp8" else ""
-        print(f"Layer ID {uid:3d} | {str(type(emodl)):40s} | {mode:10s}{marker}")
+        dtype_y = emodl.info_ts[Ttype.Y].dtype[0] if hasattr(emodl.info_ts[Ttype.Y], 'dtype') and len(emodl.info_ts[Ttype.Y].dtype) > 0 else FP16
+        dtype_p = emodl.info_ts[Ttype.P].dtype[0] if hasattr(emodl.info_ts[Ttype.P], 'dtype') and len(emodl.info_ts[Ttype.P].dtype) > 0 else FP16
+        mode_y = dtype_y.to_native().mode_name
+        mode_p = dtype_p.to_native().mode_name
+        markers = []
+        if mode_y == "low_fp8": markers.append("Y=FP8")
+        if mode_p == "low_fp8": markers.append("P=FP8")
+        marker_str = f" [DEMOTED: {', '.join(markers)}]" if markers else ""
+        print(f"Group {uid:3d} | {type(emodl).__qualname__:30s} | Y={mode_y:10s} P={mode_p:10s}{marker_str}")
     
     print("=" * 80)
     return pasn
@@ -482,7 +533,7 @@ print("assign_precision() defined ✓")
 # Cell 8: Training Function (with GradScaler)
 # ============================================================
 
-def train_epoch(model, loader, criterion, optimizer, scaler, device):
+def train_epoch(model, loader, criterion, optimizer, scaler, device, ovr_thrs=0.0):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
     total_grad_overflows = 0
@@ -505,11 +556,16 @@ def train_epoch(model, loader, criterion, optimizer, scaler, device):
         if scale_after < scale_before:
             total_grad_overflows += 1
             
-        # --- NATIVE APA: Precision Promotion ---
+        # --- NATIVE APA: Precision Promotion (matching wonyeol) ---
+        # 1. Ambil overflow/underflow RATIO dari seluruh layer
         undovrs = EModlObjMgr.get_undovrs()
-        overflow_counts = undovrs[Ttype.Y][:, 1] 
-        flag = overflow_counts > 0
-        # Promosi kembali ke FP16
+        # 2. Buat flag array: gabung P + Y (matching emodlobjmgr.inc_ts_prec order)
+        #    Format undovrs[ttype]: ndarray shape (N, 2) → kolom 0=underflow_ratio, 1=overflow_ratio
+        flag = np.concatenate([
+            undovrs[Ttype.P][:, 1] >= ovr_thrs,   # overflow ratio di parameter
+            undovrs[Ttype.Y][:, 1] >= ovr_thrs,   # overflow ratio di aktivasi
+        ])
+        # 3. Jika ada overflow, promosikan kembali ke FP16 (permanen)
         EModlObjMgr.inc_ts_prec(flag, {Ttype.Y: FP16, Ttype.P: FP16})
         
         total_loss += loss.item() * inputs.size(0)

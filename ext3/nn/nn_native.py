@@ -210,11 +210,13 @@ class NativePrecisionMixin:
         # Update amax SEBELUM casting (gunakan nilai FP32 asli)
         manager.update_amax(x, fwd_uid, FP8Config.FWD_DTYPE)
         
-        # Inject overflow_count into undovr for Pasn Tracking
+        # Inject overflow/underflow RATIO into undovr for Pasn Tracking (Ttype.Y = activation)
         if hasattr(self, 'info_ts') and hasattr(self.info_ts[Ttype.Y], 'undovr') and len(self.info_ts[Ttype.Y].undovr) > 0:
             with torch.no_grad():
-                overflow_count = (x.abs() > FP8Config.E4M3_MAX).sum().float()
-                self.info_ts[Ttype.Y].undovr[0] = torch.tensor([0.0, overflow_count], device=x.device)
+                numel = max(x.numel(), 1)
+                overflow_ratio = (x.abs() > FP8Config.E4M3_MAX).sum().float() / numel
+                underflow_ratio = torch.tensor(0.0, device=x.device)  # Underflow tracking placeholder
+                self.info_ts[Ttype.Y].undovr[0] = torch.tensor([underflow_ratio.item(), overflow_ratio.item()], device=x.device)
         
         # Cast to FP8 → immediately dequantize back
         # Ini mensimulasikan efek precision loss dari FP8
@@ -239,6 +241,15 @@ class NativePrecisionMixin:
             original_weight_data = weight.data
             weight.data = w_fp8.to(weight.dtype) * w_inv_scale
             weight_restored = True
+            
+            # Inject overflow/underflow RATIO into undovr for Pasn Tracking (Ttype.P = parameter)
+            if hasattr(self, 'info_ts') and hasattr(self.info_ts[Ttype.P], 'undovr') and len(self.info_ts[Ttype.P].undovr) > 0:
+                with torch.no_grad():
+                    for i, param in enumerate(self.parameters()):
+                        if i < len(self.info_ts[Ttype.P].undovr):
+                            p_numel = max(param.data.numel(), 1)
+                            p_overflow_ratio = (param.data.abs() > FP8Config.E4M3_MAX).sum().float() / p_numel
+                            self.info_ts[Ttype.P].undovr[i] = torch.tensor([0.0, p_overflow_ratio.item()], device=param.device)
         
         # --- Execute the original operation ---
         try:
