@@ -70,7 +70,7 @@ CONFIG = {
     'lr': 0.01,
     'momentum': 0.9,
     'weight_decay': 5e-4,
-    'num_workers': 2,
+    'num_workers': 0,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     
     # --- Native APA (Adaptive Precision Assignment) Config ---
@@ -287,7 +287,7 @@ for epoch in range(1, CONFIG['epochs'] + 1):
     train_loss, train_acc, promotions = train_epoch(
         model, trainloader, criterion, optimizer, CONFIG['device']
     )
-    test_acc = evaluate(model, testloader, criterion, CONFIG['device'])
+    _, test_acc = evaluate(model, testloader, criterion, CONFIG['device'])
     scheduler.step()
     
     epoch_time = time.time() - start_time
@@ -434,7 +434,7 @@ CONFIG = {
     'lr': 0.01,
     'momentum': 0.9,
     'weight_decay': 5e-4,
-    'num_workers': 2,
+    'num_workers': 0,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     
     # --- Native APA (Adaptive Precision Assignment) Config ---
@@ -663,7 +663,7 @@ for epoch in range(1, CONFIG['epochs'] + 1):
     train_loss, train_acc, promotions, grad_overflows = train_epoch(
         model, trainloader, criterion, optimizer, scaler, CONFIG['device']
     )
-    test_acc = evaluate(model, testloader, criterion, CONFIG['device'])
+    _, test_acc = evaluate(model, testloader, criterion, CONFIG['device'])
     scheduler.step()
     
     epoch_time = time.time() - start_time
