@@ -283,16 +283,10 @@ class EModlObjMgr():
         def _get_id(emodl: EModl, pos: str) -> Id:
             if   pos == 'cur': pass
             elif pos == 'prv':
-                try:
+                if len(emodl.info_mdprv.mdref[0]) > 0:
                     emodl = emodl.info_mdprv.mdref[0][0]
-                except IndexError:
-                    raise IndexError(
-                        f"IndexError: info_mdprv.mdref[0] is empty. "
-                        f"Layer details: type={type(emodl).__name__}, name/uid={getattr(emodl, '_layer_uid', 'N/A')}. "
-                        f"This means the input to this layer was not tracked by EModl. "
-                        f"Ensure all compute-heavy operations in the model's forward path use EModl layers."
-                    )
-            else             : raise ValueError
+                # Fallback to the current emodl if there is no tracked previous layer (e.g. first layer)
+            else: raise ValueError
             return emodl.info_mdcur.id[id_type]
         
         # main.
