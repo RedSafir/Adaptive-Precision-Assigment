@@ -252,6 +252,8 @@ print("train_epoch() defined ✓")
 # Cell 10: Main Training Loop
 # ============================================================
 
+model = VGG16Native(num_classes=10).to(CONFIG['device'])
+
 reset_fp8_manager()
 pasn_manager = assign_precision(model, CONFIG)
 
@@ -617,6 +619,8 @@ print("train_epoch() defined ✓")
             source = '''# ============================================================
 # Cell 11: Main Training Loop
 # ============================================================
+
+model = VGG16Native(num_classes=10).to(CONFIG['device'])
 
 reset_fp8_manager()
 pasn_manager = assign_precision(model, CONFIG)
