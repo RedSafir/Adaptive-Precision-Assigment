@@ -130,9 +130,11 @@ def assign_precision(model: nn.Module, config: dict) -> Pasn:
         
     EModlObjMgr.set_info_mdcur_id(new_id_grp_all)
     EModlObjMgr.reset_info(True)
+    EModlObjMgr.set_param_forward_pre()
     with torch.no_grad():
         dummy_input = torch.randn(2, 3, 32, 32).to(config['device'])
         model(dummy_input)
+    EModlObjMgr.set_param_backward_pos(1.0)
     EModlObjMgr.reset_info(False)
     
     # 3. Initialize effective tensor numels (for future batch sizes)
@@ -495,10 +497,12 @@ def assign_precision(model: nn.Module, config: dict) -> Pasn:
         
     EModlObjMgr.set_info_mdcur_id(new_id_grp_all)
     EModlObjMgr.reset_info(True)
+    EModlObjMgr.set_param_forward_pre()
     with torch.no_grad():
         with autocast(dtype=torch.float16):
             dummy_input = torch.randn(2, 3, 32, 32).to(config['device'])
             model(dummy_input)
+    EModlObjMgr.set_param_backward_pos(1.0)
     EModlObjMgr.reset_info(False)
     
     # Initialize effective tensor numels (for future batch sizes)
