@@ -31,8 +31,8 @@ Saat sebuah grup terpilih oleh scheduler APA untuk didegradasi presisinya demi m
 ### 3. Zero-Cost Overflow Promotion
 Untuk mencegah terjadinya ketidakstabilan numerik (*numerical instability*) atau gradien meledak (*exploded gradients*) yang berujung pada nilai `NaN`, sistem menginjeksikan pemantauan overflow berbiaya nol (*zero-cost overflow tracking*) secara *on-the-fly* pada setiap operasi komputasi FP8:
 *   **Metrik Rasio:** Sistem menghitung rasio overflow riil pada aktivasi dan bobot parameter terhadap total elemen tensor:
-    $$\text{Overflow Ratio} = \frac{\sum (|T| > \text{Max\_Representable\_Value})}{N_{\text{elements}}}$$
-    Di mana $\text{Max\_Representable\_Value}$ untuk format FP8 E4M3 bernilai **448.0**.
+    $$\text{Rasio Overflow} = \frac{\sum (|T| > V_{\text{max}})}{N_{\text{elemen}}}$$
+    Di mana $V_{\text{max}}$ (Nilai Maksimal Representasi) untuk format FP8 E4M3 bernilai **448.0**.
 *   **Promosi Dinamis:** Jika rasio overflow pada salah satu representasi tensor melewati ambang batas (`ovr_thrs`), grup layer tersebut akan **dipromosikan kembali ke presisi tinggi** (TF32 atau FP16) secara permanen untuk iterasi-iterasi selanjutnya guna mengamankan konvergensi model.
 
 ---
