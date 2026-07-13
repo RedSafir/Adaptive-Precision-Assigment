@@ -30,6 +30,7 @@ if PROJECT_ROOT not in sys.path:
 print(f'[INFO] Project root: {PROJECT_ROOT}')
 
 # ---- Import ext3 modules ----
+from ext3.nn import flatten
 from ext3.nn.nn_native import (
     NativeConv2d, NativeLinear, NativeBatchNorm2d,
     NativeReLU, NativeMaxPool2d, NativeAdaptiveAvgPool2d,
@@ -82,6 +83,14 @@ print("\\n=== Training Configuration ===")
 for k, v in CONFIG.items():
     print(f"  {k:20s}: {v}")
 '''
+            cell['source'] = [line + '\n' for line in source.split('\n')][:-1]
+            break
+
+    # 2b. VGG16Native definition - replace torch.flatten with flatten from ext3.nn
+    for cell in nb['cells']:
+        if cell['cell_type'] == 'code' and 'class VGG16Native' in ''.join(cell['source']):
+            source = ''.join(cell['source'])
+            source = source.replace('torch.flatten(x, 1)', 'flatten(x, 1)')
             cell['source'] = [line + '\n' for line in source.split('\n')][:-1]
             break
 
@@ -378,6 +387,7 @@ if PROJECT_ROOT not in sys.path:
 print(f'[INFO] Project root: {PROJECT_ROOT}')
 
 # ---- Import ext3 modules ----
+from ext3.nn import flatten
 from ext3.nn.nn_native import (
     NativeConv2d, NativeLinear, NativeBatchNorm2d,
     NativeReLU, NativeMaxPool2d, NativeAdaptiveAvgPool2d,
@@ -436,6 +446,14 @@ print("\\n=== Training Configuration ===")
 for k, v in CONFIG.items():
     print(f"  {k:20s}: {v}")
 '''
+            cell['source'] = [line + '\n' for line in source.split('\n')][:-1]
+            break
+
+    # 2b. VGG16Native definition - replace torch.flatten with flatten from ext3.nn
+    for cell in nb['cells']:
+        if cell['cell_type'] == 'code' and 'class VGG16Native' in ''.join(cell['source']):
+            source = ''.join(cell['source'])
+            source = source.replace('torch.flatten(x, 1)', 'flatten(x, 1)')
             cell['source'] = [line + '\n' for line in source.split('\n')][:-1]
             break
 
