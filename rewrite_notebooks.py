@@ -126,7 +126,10 @@ def assign_precision(model: nn.Module, config: dict) -> Pasn:
         model(dummy_input)
     EModlObjMgr.reset_info(False)
     
-    # 3. Create Pasn & Dtypes
+    # 3. Initialize effective tensor numels (for future batch sizes)
+    EModlObjMgr.set_info_ts_numel(2, config['batch_size'])
+    
+    # 4. Create Pasn & Dtypes
     # Gunakan Dtype FP8 representasi (8-bit total = low_fp8)
     FP8 = Dtype(4, 3, 0) 
     
@@ -476,6 +479,9 @@ def assign_precision(model: nn.Module, config: dict) -> Pasn:
             dummy_input = torch.randn(2, 3, 32, 32).to(config['device'])
             model(dummy_input)
     EModlObjMgr.reset_info(False)
+    
+    # Initialize effective tensor numels (for future batch sizes)
+    EModlObjMgr.set_info_ts_numel(2, config['batch_size'])
     
     FP8 = Dtype(4, 3, 0)
     pasn = Pasn(EModlObjMgr.get_emodls(), dtype_fwd=FP16)
