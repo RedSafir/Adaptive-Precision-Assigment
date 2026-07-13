@@ -168,6 +168,7 @@ def assign_precision(model: nn.Module, config: dict) -> Pasn:
     
     # Apply to Graph
     EModlObjMgr.set_info_ts_dtype(pasn)
+    EModlObjMgr.set_info_ts_rndmd()
     
     print(f"  Target Demotion Ratio : {target_ratio:.3f}")
     print(f"  Total Layers          : {len(EModlObjMgr.get_emodls_sort())}")
@@ -524,6 +525,7 @@ def assign_precision(model: nn.Module, config: dict) -> Pasn:
     pasn.update_by_id_grp_all('prv', 'id', upd_dtplan_prv, upd_idvals)
     
     EModlObjMgr.set_info_ts_dtype(pasn)
+    EModlObjMgr.set_info_ts_rndmd()
     
     print(f"  Target Demotion Ratio : {target_ratio:.3f}")
     print(f"  Total Layers          : {len(EModlObjMgr.get_emodls_sort())}")
