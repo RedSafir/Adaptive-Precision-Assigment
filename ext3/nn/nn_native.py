@@ -68,6 +68,182 @@ def reset_fp8_manager() -> None:
 
 
 # ============================================================
+# Custom Autograd Functions for Hardware-Accelerated FP8
+# ============================================================
+
+class FP8LinearFunction(torch.autograd.Function):
+    """Custom autograd untuk operasi Linear FP8 menggunakan torch._scaled_mm."""
+    
+    @staticmethod
+    def forward(ctx, x, weight, bias, scale_x, scale_w):
+        # Save inputs for backward (done in high precision for stability)
+        ctx.save_for_backward(x, weight, bias)
+        
+        # Sourcing from delayed scaling manager
+        inv_scale_x = 1.0 / scale_x
+        inv_scale_w = 1.0 / scale_w
+        
+        # Cast input & weight to FP8
+        x_fp8 = (x * scale_x).clamp(-FP8Config.E4M3_MAX, FP8Config.E4M3_MAX).to(torch.float8_e4m3fn)
+        w_fp8 = (weight * scale_w).clamp(-FP8Config.E4M3_MAX, FP8Config.E4M3_MAX).to(torch.float8_e4m3fn)
+        
+        # Fallback to CPU-based float matmul if running on CPU
+        if not x.is_cuda:
+            x_dequant = x_fp8.to(x.dtype) * inv_scale_x
+            w_dequant = w_fp8.to(weight.dtype) * inv_scale_w
+            out = x_dequant.matmul(w_dequant.t())
+            if bias is not None:
+                out = out + bias
+            return out
+            
+        device = x.device
+        scale_x_tensor = torch.tensor([inv_scale_x], device=device, dtype=torch.float32)
+        scale_w_tensor = torch.tensor([inv_scale_w], device=device, dtype=torch.float32)
+        
+        try:
+            out = torch._scaled_mm(
+                x_fp8,
+                w_fp8.t(),
+                scale_a=scale_x_tensor,
+                scale_b=scale_w_tensor,
+                out_dtype=x.dtype
+            )
+            if isinstance(out, tuple):
+                out = out[0]
+        except Exception as e:
+            # Fallback to simulated FP8 on older/unsupported CUDA devices
+            x_dequant = x_fp8.to(x.dtype) * inv_scale_x
+            w_dequant = w_fp8.to(weight.dtype) * inv_scale_w
+            out = x_dequant.matmul(w_dequant.t())
+            
+        if bias is not None:
+            out = out + bias
+            
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight, bias = ctx.saved_tensors
+        
+        grad_x = None
+        grad_weight = None
+        grad_bias = None
+        
+        # High-precision backward pass via standard PyTorch operators
+        if ctx.needs_input_grad[0]:
+            grad_x = grad_output.matmul(weight)
+        if ctx.needs_input_grad[1]:
+            grad_weight = grad_output.t().matmul(x)
+        if ctx.needs_input_grad[2] and bias is not None:
+            grad_bias = grad_output.sum(dim=0)
+            
+        return grad_x, grad_weight, grad_bias, None, None
+
+
+class FP8Conv2dFunction(torch.autograd.Function):
+    """Custom autograd untuk operasi Conv2d FP8 menggunakan im2col + torch._scaled_mm."""
+    
+    @staticmethod
+    def forward(ctx, x, weight, bias, stride, padding, dilation, groups, scale_x, scale_w):
+        ctx.save_for_backward(x, weight, bias)
+        ctx.stride = stride
+        ctx.padding = padding
+        ctx.dilation = dilation
+        ctx.groups = groups
+        
+        batch_size, in_channels, in_h, in_w = x.shape
+        out_channels, _, kernel_h, kernel_w = weight.shape
+        
+        # Calculate spatial output dimensions
+        out_h = (in_h + 2 * padding[0] - dilation[0] * (kernel_h - 1) - 1) // stride[0] + 1
+        out_w = (in_w + 2 * padding[1] - dilation[1] * (kernel_w - 1) - 1) // stride[1] + 1
+        
+        # Fallback to standard high-precision CPU execution
+        if not x.is_cuda:
+            return F.conv2d(x, weight, bias, stride, padding, dilation, groups)
+            
+        # 1. Spatial unfolding (im2col) to convert 4D input to 2D
+        x_unfold = F.unfold(
+            x, 
+            kernel_size=(kernel_h, kernel_w), 
+            dilation=dilation, 
+            padding=padding, 
+            stride=stride
+        )
+        
+        # Transpose and reshape to 2D matrix: (batch_size * L, C * kh * kw)
+        x_cols = x_unfold.transpose(1, 2).reshape(-1, in_channels * kernel_h * kernel_w)
+        
+        # Reshape weight to 2D matrix: (out_channels, C * kh * kw)
+        w_mat = weight.reshape(out_channels, -1)
+        
+        # Sourcing from delayed scaling manager
+        inv_scale_x = 1.0 / scale_x
+        inv_scale_w = 1.0 / scale_w
+        
+        # Cast input & weight to FP8
+        x_cols_fp8 = (x_cols * scale_x).clamp(-FP8Config.E4M3_MAX, FP8Config.E4M3_MAX).to(torch.float8_e4m3fn)
+        w_mat_fp8 = (w_mat * scale_w).clamp(-FP8Config.E4M3_MAX, FP8Config.E4M3_MAX).to(torch.float8_e4m3fn)
+        
+        device = x.device
+        scale_x_tensor = torch.tensor([inv_scale_x], device=device, dtype=torch.float32)
+        scale_w_tensor = torch.tensor([inv_scale_w], device=device, dtype=torch.float32)
+        
+        try:
+            out_mat = torch._scaled_mm(
+                x_cols_fp8,
+                w_mat_fp8.t(),
+                scale_a=scale_x_tensor,
+                scale_b=scale_w_tensor,
+                out_dtype=x.dtype
+            )
+            if isinstance(out_mat, tuple):
+                out_mat = out_mat[0]
+        except Exception as e:
+            # Fallback for non-supported GPUs (simulate FP8)
+            x_cols_dequant = x_cols_fp8.to(x.dtype) * inv_scale_x
+            w_mat_dequant = w_mat_fp8.to(weight.dtype) * inv_scale_w
+            out_mat = x_cols_dequant.matmul(w_mat_dequant.t())
+            
+        # Reshape back to 4D spatial tensor
+        out_tensor = out_mat.reshape(batch_size, out_h * out_w, out_channels)
+        out_tensor = out_tensor.transpose(1, 2).reshape(batch_size, out_channels, out_h, out_w)
+        
+        if bias is not None:
+            out_tensor = out_tensor + bias.view(1, -1, 1, 1)
+            
+        return out_tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight, bias = ctx.saved_tensors
+        stride = ctx.stride
+        padding = ctx.padding
+        dilation = ctx.dilation
+        groups = ctx.groups
+        
+        grad_x = None
+        grad_weight = None
+        grad_bias = None
+        
+        # Explicit stable gradient calculations using PyTorch built-in gradient utilities
+        if ctx.needs_input_grad[0]:
+            grad_x = torch.nn.grad.conv2d_input(
+                x.shape, weight, grad_output,
+                stride=stride, padding=padding, dilation=dilation, groups=groups
+            )
+        if ctx.needs_input_grad[1]:
+            grad_weight = torch.nn.grad.conv2d_weight(
+                x, weight.shape, grad_output,
+                stride=stride, padding=padding, dilation=dilation, groups=groups
+            )
+        if ctx.needs_input_grad[2] and bias is not None:
+            grad_bias = grad_output.sum(dim=(0, 2, 3))
+            
+        return grad_x, grad_weight, grad_bias, None, None, None, None, None, None
+
+
+# ============================================================
 # NativePrecisionMixin
 # ============================================================
 class NativePrecisionMixin:
@@ -79,18 +255,6 @@ class NativePrecisionMixin:
     - Method `set_native_precision()` untuk mengubah mode saat runtime
     - Method `_native_forward_wrapper()` yang mem-dispatch ke handler 
       yang sesuai berdasarkan mode
-    
-    FP8 Forward Pipeline:
-    1. Ambil scale factor dari FP8ScalingManager (delayed scaling)
-    2. Cast input ke FP8 E4M3 dengan scale
-    3. Cast weight ke FP8 E4M3 dengan scale
-    4. Eksekusi operasi (dequantize ke FP32 → matmul → atau scaled_mm)
-    5. Update amax history untuk scaling iterasi berikutnya
-    
-    FP8 Backward (Gradient):
-    - Otomatis ditangani: backward tetap dalam FP32 (autograd default)
-    - Gradient weight/input tidak di-cast ke FP8 di sini,
-      karena gradient scaling sudah ditangani oleh GradScaler level training loop
     """
     
     _native_mode: Opt[NativePrecisionMode] = None
@@ -127,7 +291,6 @@ class NativePrecisionMixin:
     def _ensure_layer_uid(self) -> str:
         """Generate unique layer ID jika belum ada."""
         if not self._layer_uid:
-            # Gunakan class name + id() sebagai uid
             self._layer_uid = f"{type(self).__name__}_{id(self)}"
         return self._layer_uid
     
@@ -139,42 +302,26 @@ class NativePrecisionMixin:
     ) -> torch.Tensor:
         """
         Dispatch forward pass berdasarkan precision mode.
-        
-        Args:
-            original_forward_fn: Fungsi forward asli dari parent class.
-            *args, **kwargs: Arguments untuk forward.
-            
-        Returns:
-            Output tensor.
         """
         native_mode_obj = None
-        # Gunakan dynamic precision dari Pasn/EModl jika tersedia
         if hasattr(self, 'info_ts') and hasattr(self.info_ts[Ttype.Y], 'dtype') and len(self.info_ts[Ttype.Y].dtype) > 0:
             target_dtype = self.info_ts[Ttype.Y].dtype[0]
             if hasattr(target_dtype, 'to_native'):
                 native_mode_obj = target_dtype.to_native().mode_name
-                
-        # Fallback ke static mode jika disetel secara manual
+                 
         mode = native_mode_obj if native_mode_obj is not None else (self._native_mode.value if self._native_mode else None)
         
         if mode is None or mode == NativePrecisionMode.BASE_TF32.value:
-            # ---- TF32 Mode ----
-            # Tidak perlu wrapper apapun.
-            # TF32 aktif secara global via torch.backends.cuda.matmul.allow_tf32
             return original_forward_fn(*args, **kwargs)
         
         elif mode == NativePrecisionMode.BASE_FP16.value:
-            # ---- FP16 Mode ----
-            # Bungkus komputasi dengan autocast FP16
             with torch.cuda.amp.autocast(dtype=torch.float16):
                 return original_forward_fn(*args, **kwargs)
         
         elif mode == NativePrecisionMode.LOW_FP8.value:
-            # ---- FP8 Mode ----
             return self._fp8_forward(original_forward_fn, *args, **kwargs)
         
         else:
-            # Fallback: eksekusi normal
             return original_forward_fn(*args, **kwargs)
     
     def _fp8_forward(
@@ -184,19 +331,7 @@ class NativePrecisionMixin:
         **kwargs
     ) -> torch.Tensor:
         """
-        Forward pass menggunakan FP8 dengan delayed scaling.
-        
-        Pipeline:
-        1. Ambil input tensor (arg pertama)
-        2. Hitung scale, cast input+weight ke FP8
-        3. Dequantize → eksekusi operasi → output dalam FP32
-        4. Update amax history
-        
-        CATATAN: Saat ini, implementasi ini melakukan:
-          - FP8 quantize → dequantize → standard op
-          - Ini memberikan efek precision FP8 sambil menjaga kompatibilitas
-          - Pada GPU dengan torch._scaled_mm support, bisa dioptimalkan
-            untuk true FP8 matmul
+        Forward pass menggunakan hardware-accelerated FP8.
         """
         layer_uid = self._ensure_layer_uid()
         manager = get_fp8_manager()
@@ -205,19 +340,28 @@ class NativePrecisionMixin:
         if len(args) > 0:
             x = args[0]
         else:
-            # Coba ambil dari kwargs
             x = kwargs.get('input', kwargs.get('x', None))
             if x is None:
                 return original_forward_fn(*args, **kwargs)
         
-        if not isinstance(x, torch.Tensor) or not x.is_cuda:
+        if not isinstance(x, torch.Tensor):
             return original_forward_fn(*args, **kwargs)
-        
-        # --- Input FP8 Casting ---
+            
+        # Check alignment requirements for FP8 Tensor Cores (Kelipatan 16)
+        if isinstance(self, nn.Conv2d):
+            kh, kw = self.kernel_size
+            k_val = self.in_channels * kh * kw
+            if k_val % 16 != 0 or self.out_channels % 16 != 0:
+                return original_forward_fn(*args, **kwargs)
+        elif isinstance(self, nn.Linear):
+            if self.in_features % 16 != 0 or self.out_features % 16 != 0:
+                return original_forward_fn(*args, **kwargs)
+        else:
+            return original_forward_fn(*args, **kwargs)
+            
+        # --- Update Amax and compute delayed scaling factors ---
         fwd_uid = f"{layer_uid}.fwd_input"
         scale_input = manager.compute_scale(fwd_uid, FP8Config.FWD_DTYPE)
-        
-        # Update amax SEBELUM casting (gunakan nilai FP32 asli)
         manager.update_amax(x, fwd_uid, FP8Config.FWD_DTYPE)
         
         # Inject overflow/underflow RATIO into undovr for Pasn Tracking (Ttype.Y = activation)
@@ -227,30 +371,13 @@ class NativePrecisionMixin:
                 overflow_ratio = (x.abs() > FP8Config.E4M3_MAX).sum().float() / numel
                 underflow_ratio = torch.tensor(0.0, device=x.device)  # Underflow tracking placeholder
                 self.info_ts[Ttype.Y].undovr[0] = torch.tensor([underflow_ratio.item(), overflow_ratio.item()], device=x.device)
-        
-        # Cast to FP8 → immediately dequantize back
-        # Ini mensimulasikan efek precision loss dari FP8
-        # sambil tetap kompatibel dengan semua PyTorch ops
-        x_fp8, inv_scale = fp8_cast_forward(x, scale_input, FP8Config.FWD_DTYPE)
-        x_dequant = x_fp8.to(x.dtype) * inv_scale
-        
+                
         # --- Weight FP8 Casting (jika module punya weight) ---
-        weight_restored = False
-        original_weight_data = None
-        
-        if hasattr(self, 'weight') and self.weight is not None:  # type: ignore
-            weight = self.weight  # type: ignore
+        scale_weight = 1.0
+        if hasattr(self, 'weight') and self.weight is not None:
             wt_uid = f"{layer_uid}.fwd_weight"
             scale_weight = manager.compute_scale(wt_uid, FP8Config.FWD_DTYPE)
-            manager.update_amax(weight.data, wt_uid, FP8Config.FWD_DTYPE)
-            
-            # Cast weight ke FP8 → dequantize
-            w_fp8, w_inv_scale = fp8_cast_forward(
-                weight.data, scale_weight, FP8Config.FWD_DTYPE
-            )
-            original_weight_data = weight.data
-            weight.data = w_fp8.to(weight.dtype) * w_inv_scale
-            weight_restored = True
+            manager.update_amax(self.weight.data, wt_uid, FP8Config.FWD_DTYPE)
             
             # Inject overflow/underflow RATIO into undovr for Pasn Tracking (Ttype.P = parameter)
             if hasattr(self, 'info_ts') and hasattr(self.info_ts[Ttype.P], 'undovr') and len(self.info_ts[Ttype.P].undovr) > 0:
@@ -260,46 +387,42 @@ class NativePrecisionMixin:
                             p_numel = max(param.data.numel(), 1)
                             p_overflow_ratio = (param.data.abs() > FP8Config.E4M3_MAX).sum().float() / p_numel
                             self.info_ts[Ttype.P].undovr[i] = torch.tensor([0.0, p_overflow_ratio.item()], device=param.device)
-        
-        # --- Execute the original operation ---
-        try:
-            if len(args) > 0:
-                new_args = (x_dequant,) + args[1:]
-                output = original_forward_fn(*new_args, **kwargs)
+
+        # Dispatch forward to custom autograd functions
+        if isinstance(self, nn.Conv2d):
+            return FP8Conv2dFunction.apply(
+                x, self.weight, self.bias, 
+                self.stride, self.padding, self.dilation, self.groups,
+                scale_input, scale_weight
+            )
+        elif isinstance(self, nn.Linear):
+            # Flatten to 2D
+            orig_shape = x.shape
+            if len(orig_shape) > 2:
+                x_2d = x.reshape(-1, orig_shape[-1])
             else:
-                kwargs_copy = dict(kwargs)
-                if 'input' in kwargs_copy:
-                    kwargs_copy['input'] = x_dequant
-                elif 'x' in kwargs_copy:
-                    kwargs_copy['x'] = x_dequant
-                output = original_forward_fn(**kwargs_copy)
-        finally:
-            # Restore original weight
-            if weight_restored and original_weight_data is not None:
-                self.weight.data = original_weight_data  # type: ignore
-        
-        return output
+                x_2d = x
+            out_2d = FP8LinearFunction.apply(
+                x_2d, self.weight, self.bias,
+                scale_input, scale_weight
+            )
+            if len(orig_shape) > 2:
+                return out_2d.reshape(orig_shape[:-1] + (self.out_features,))
+            return out_2d
+        else:
+            return original_forward_fn(*args, **kwargs)
 
 
 # ============================================================
 # Native Precision Layer Wrappers
 # ============================================================
-# Layer yang memiliki weight (Conv2d, Linear) → mendapat full FP8 support
-# Layer tanpa weight (ReLU, Pooling, BN) → hanya TF32/FP16 support
 
 class NativeConv2d(NativePrecisionMixin, nn.Conv2d, EModl):
     """
     Conv2d dengan native hardware precision support.
-    
-    Mode yang didukung:
-    - base_tf32: Conv2d biasa, TF32 aktif via global flag
-    - base_fp16: Conv2d dibungkus autocast FP16
-    - low_fp8: Input dan weight di-cast ke FP8 E4M3, 
-               dequantize, lalu eksekusi conv2d
     """
     
     def __init__(self, *args, **kwargs):
-        # Extract native_mode jika diberikan sebelum super().__init__
         native_mode = kwargs.pop('native_mode', None)
         super(NativeConv2d, self).__init__(*args, **kwargs)
         self._layer_uid = f"NativeConv2d_{id(self)}"
@@ -307,14 +430,12 @@ class NativeConv2d(NativePrecisionMixin, nn.Conv2d, EModl):
             self.set_native_precision(native_mode)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass dengan precision dispatch."""
         out = self._native_forward_wrapper(
             self._conv_forward_native, x
         )
         return out
     
     def _conv_forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        """Execute conv2d operation."""
         return F.conv2d(
             x, self.weight, self.bias,
             self.stride, self.padding, self.dilation, self.groups
@@ -324,12 +445,6 @@ class NativeConv2d(NativePrecisionMixin, nn.Conv2d, EModl):
 class NativeLinear(NativePrecisionMixin, nn.Linear, EModl):
     """
     Linear layer dengan native hardware precision support.
-    
-    Mode yang didukung:
-    - base_tf32: Linear biasa, TF32 aktif via global flag
-    - base_fp16: Linear dibungkus autocast FP16
-    - low_fp8: Input dan weight di-cast ke FP8 E4M3,
-               dequantize, lalu eksekusi linear
     """
     
     def __init__(self, *args, **kwargs):
@@ -340,46 +455,39 @@ class NativeLinear(NativePrecisionMixin, nn.Linear, EModl):
             self.set_native_precision(native_mode)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass dengan precision dispatch."""
         out = self._native_forward_wrapper(
             self._linear_forward_native, x
         )
         return out
     
     def _linear_forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        """Execute linear operation."""
         return F.linear(x, self.weight, self.bias)
 
 
 # ============================================================
-# Non-compute-heavy layers: hanya TF32/FP16, tidak perlu FP8
+# Non-compute-heavy layers
 # ============================================================
 
 class NativeBatchNorm2d(nn.BatchNorm2d, EModl):
-    """
-    BatchNorm2d — selalu beroperasi di FP32 (best practice).
-    
-    BatchNorm memerlukan presisi tinggi untuk running stats (mean, variance).
-    Bahkan di mixed-precision training, BN selalu di FP32.
-    """
+    """BatchNorm2d — selalu beroperasi di FP32 (best practice)."""
     pass
 
 
 class NativeReLU(nn.ReLU, EModl):
-    """ReLU — operasi element-wise, tidak memerlukan precision khusus."""
+    """ReLU — operasi element-wise."""
     pass
 
 
 class NativeMaxPool2d(nn.MaxPool2d, EModl):
-    """MaxPool2d — operasi comparison, presisi tidak berpengaruh."""
+    """MaxPool2d — operasi comparison."""
     pass
 
 
 class NativeAdaptiveAvgPool2d(nn.AdaptiveAvgPool2d, EModl):
-    """AdaptiveAvgPool2d — averaging, tetap FP32 untuk akurasi."""
+    """AdaptiveAvgPool2d — averaging."""
     pass
 
 
 class NativeDropout(nn.Dropout, EModl):
-    """Dropout — mask operation, presisi tidak berpengaruh."""
+    """Dropout — mask operation."""
     pass
