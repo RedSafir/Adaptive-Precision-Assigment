@@ -129,13 +129,20 @@ class FP8LinearFunction(torch.autograd.Function):
         grad_weight = None
         grad_bias = None
         
+        # Squeeze/cast inputs and grad_output to the same dtype (target_dtype)
+        # to prevent type mismatch errors during backward pass.
+        target_dtype = x.dtype
+        grad_output_c = grad_output.to(target_dtype)
+        weight_c = weight.to(target_dtype)
+        x_c = x.to(target_dtype)
+        
         # High-precision backward pass via standard PyTorch operators
         if ctx.needs_input_grad[0]:
-            grad_x = grad_output.matmul(weight)
+            grad_x = grad_output_c.matmul(weight_c).to(x.dtype)
         if ctx.needs_input_grad[1]:
-            grad_weight = grad_output.t().matmul(x)
+            grad_weight = grad_output_c.t().matmul(x_c).to(weight.dtype)
         if ctx.needs_input_grad[2] and bias is not None:
-            grad_bias = grad_output.sum(dim=0)
+            grad_bias = grad_output_c.sum(dim=0).to(bias.dtype)
             
         return grad_x, grad_weight, grad_bias, None, None
 
@@ -226,19 +233,28 @@ class FP8Conv2dFunction(torch.autograd.Function):
         grad_weight = None
         grad_bias = None
         
+        # Squeeze/cast inputs and grad_output to the same dtype (target_dtype)
+        # to prevent type mismatch errors during backward pass.
+        target_dtype = x.dtype
+        grad_output_c = grad_output.to(target_dtype)
+        weight_c = weight.to(target_dtype)
+        x_c = x.to(target_dtype)
+        
         # Explicit stable gradient calculations using PyTorch built-in gradient utilities
         if ctx.needs_input_grad[0]:
             grad_x = torch.nn.grad.conv2d_input(
-                x.shape, weight, grad_output,
+                x_c.shape, weight_c, grad_output_c,
                 stride=stride, padding=padding, dilation=dilation, groups=groups
             )
+            grad_x = grad_x.to(x.dtype)
         if ctx.needs_input_grad[1]:
             grad_weight = torch.nn.grad.conv2d_weight(
-                x, weight.shape, grad_output,
+                x_c, weight_c.shape, grad_output_c,
                 stride=stride, padding=padding, dilation=dilation, groups=groups
             )
+            grad_weight = grad_weight.to(weight.dtype)
         if ctx.needs_input_grad[2] and bias is not None:
-            grad_bias = grad_output.sum(dim=(0, 2, 3))
+            grad_bias = grad_output_c.sum(dim=(0, 2, 3)).to(bias.dtype)
             
         return grad_x, grad_weight, grad_bias, None, None, None, None, None, None
 
