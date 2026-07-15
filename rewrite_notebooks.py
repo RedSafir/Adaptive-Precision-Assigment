@@ -9,6 +9,19 @@ def find_and_replace_cell(nb, keyword, new_source):
             return True
     return False
 
+def sanitize_notebook_unicode(nb):
+    """Sanitize all code cells to remove characters that fail to encode in Windows CP1252."""
+    for cell in nb['cells']:
+        if cell['cell_type'] == 'code':
+            source = []
+            for line in cell['source']:
+                line = line.replace('✓', '[OK]')
+                line = line.replace('α', 'alpha')
+                line = line.replace('σ', 'sigma')
+                line = line.replace('→', '->')
+                source.append(line)
+            cell['source'] = source
+
 def rewrite_tf32_notebook():
     with open('vgg16_cifar10_tf32_fp8.ipynb', 'r', encoding='utf-8') as f:
         nb = json.load(f)
@@ -60,7 +73,7 @@ if torch.cuda.is_available():
     print(f"GPU Name       : {torch.cuda.get_device_name(0)}")
 print(f"FP8 Supported  : {check_fp8_support()}")
 '''
-    find_and_replace_cell(nb, 'Cell 2: Imports & Environment Check', imports_source)
+    find_and_replace_cell(nb, 'Cell 2: Imports', imports_source)
 
     # 2. Config
     config_source = '''# ============================================================
@@ -104,9 +117,9 @@ for k, v in CONFIG.items():
 # ============================================================
 
 # APA v2.0 — imported via ext3.nn imports cell above
-print("APA v2.0: assign_precision + APAStabilityMonitor imported ✓")
+print("APA v2.0: assign_precision + APAStabilityMonitor imported [OK]")
 '''
-    find_and_replace_cell(nb, 'Cell 5: Precision Assignment Setup', setup_source)
+    find_and_replace_cell(nb, 'Cell 5: Precision Assignment', setup_source)
 
     # 4. Train Epoch (with Promotion)
     train_source = '''# ============================================================
@@ -144,15 +157,38 @@ def train_epoch(model, loader, criterion, optimizer, device, monitor):
         total += targets.size(0)
         correct += predicted.eq(targets).sum().item()
     
-    # Dapatkan jumlah promosi epoch ini
+    # Map promotions
     flags = EModlObjMgr.get_inc_ts_prec_flag()
-    total_promotions = sum([1 for f in flags if f > 0.0])
+    promoted_details = []
+    if len(flags) > 0 and sum(flags) > 0:
+        cnt = -1
+        mapping = {}
+        from ext3.core.include.ttype import Ttype
+        for ttype in (Ttype.P, Ttype.Y):
+            for emodl in EModlObjMgr.get_emodls_sort():
+                if ttype in emodl.info_ts and hasattr(emodl.info_ts[ttype], 'undovr'):
+                    for tsind, _ in enumerate(emodl.info_ts[ttype].undovr):
+                        cnt += 1
+                        mapping[cnt] = (ttype, emodl, tsind)
+        for idx, f in enumerate(flags):
+            if f > 0.0:
+                tt = mapping.get(idx)
+                if tt:
+                    ttype, emodl, tsind = tt
+                    gid = emodl.info_mdcur.id['grp_all'].val
+                    promoted_details.append({
+                        'group_id': gid,
+                        'layer_name': type(emodl).__name__,
+                        'ttype': 'Parameter' if ttype == Ttype.P else 'Activation',
+                        'index': tsind
+                    })
     
+    total_promotions = len(promoted_details)
     avg_loss = total_loss / total
     accuracy = 100.0 * correct / total
-    return avg_loss, accuracy, total_promotions, epoch_events
+    return avg_loss, accuracy, total_promotions, promoted_details, epoch_events
 
-print("train_epoch() defined ✓ [APA v2.0: EMA-Gated]")
+print("train_epoch() defined [OK] [APA v2.0: EMA-Gated]")
 '''
     find_and_replace_cell(nb, 'Cell 8: Training Function', train_source)
 
@@ -166,6 +202,54 @@ model = VGG16Native(num_classes=10).to(CONFIG['device'])
 reset_fp8_manager()
 pasn_manager = assign_precision(model, CONFIG)
 
+# --- Grouping & Demotion Analysis ---
+group_stats = {}
+total_params_all = 0
+total_params_fp8 = 0
+
+for emodl in EModlObjMgr.get_emodls_sort():
+    gid = emodl.info_mdcur.id['grp_all'].val
+    if gid not in group_stats:
+        group_stats[gid] = {
+            'layers': [],
+            'params': 0,
+            'mode_y': 'unknown',
+            'mode_p': 'unknown'
+        }
+    
+    n_params = sum(p.numel() for p in emodl.parameters())
+    total_params_all += n_params
+    group_stats[gid]['params'] += n_params
+    group_stats[gid]['layers'].append(type(emodl).__name__)
+    
+    dtype_y = (emodl.info_ts[Ttype.Y].dtype[0]
+               if hasattr(emodl.info_ts[Ttype.Y], 'dtype')
+               and len(emodl.info_ts[Ttype.Y].dtype) > 0
+               else FP32)
+    dtype_p = (emodl.info_ts[Ttype.P].dtype[0]
+               if hasattr(emodl.info_ts[Ttype.P], 'dtype')
+               and len(emodl.info_ts[Ttype.P].dtype) > 0
+               else FP32)
+    mode_y = dtype_y.to_native().mode_name
+    mode_p = dtype_p.to_native().mode_name
+    group_stats[gid]['mode_y'] = mode_y
+    group_stats[gid]['mode_p'] = mode_p
+    
+    if mode_p == 'low_fp8':
+        total_params_fp8 += n_params
+
+print("\\n" + "="*80)
+print("ANALISIS TENSOR GROUPING & DEMOTION")
+print("="*80)
+print(f"Total Parameter Model: {total_params_all:,}")
+print(f"Total Parameter FP8  : {total_params_fp8:,} ({total_params_fp8/total_params_all*100:.2f}%)")
+print("-"*80)
+print(f"{'Group ID':<10} | {'Jumlah Layer':<12} | {'Total Params':<15} | {'Activation (Y)':<15} | {'Parameter (P)':<15}")
+print("-"*80)
+for gid, stats in sorted(group_stats.items()):
+    print(f"{gid:<10d} | {len(stats['layers']):<12d} | {stats['params']:<15,d} | {stats['mode_y']:<15s} | {stats['mode_p']:<15s}")
+print("="*80)
+
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.SGD(model.parameters(), lr=CONFIG['lr'], 
                       momentum=CONFIG['momentum'], weight_decay=CONFIG['weight_decay'])
@@ -173,12 +257,12 @@ scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG['epochs
 
 # --- APA v2.0: Initialize EMA-Gated Stability Monitor ---
 monitor = APAStabilityMonitor(
-    ema_alpha=0.1,            # EMA smoothing (tunable: 0.05-0.3)
-    variance_threshold=2.0,   # Spike sensitivity in σ (tunable: 1.5-4.0)
+    ema_alpha=0.1,            # EMA smoothing (alpha)
+    variance_threshold=2.0,   # Spike sensitivity in sigma (sigma)
     ovr_thrs=0.0,             # Any overflow triggers promotion
     warmup_steps=10,          # EMA calibration period
 )
-print(f"APA v2.0 Monitor initialized: α={0.1}, σ_thresh={2.0}, warmup={10}")
+print(f"APA v2.0 Monitor initialized: alpha={0.1}, sigma_thresh={2.0}, warmup={10}")
 
 history = {
     'train_loss': [],
@@ -188,6 +272,7 @@ history = {
     'lr': [],
     'promotions': [],
     'spike_events': [],
+    'promotion_details': [],
 }
 
 print("\\n" + "=" * 105)
@@ -201,7 +286,7 @@ for epoch in range(1, CONFIG['epochs'] + 1):
     start_time = time.time()
     current_lr = optimizer.param_groups[0]['lr']
     
-    train_loss, train_acc, promotions, events = train_epoch(
+    train_loss, train_acc, promotions, promoted_details, events = train_epoch(
         model, trainloader, criterion, optimizer, CONFIG['device'], monitor
     )
     _, test_acc = evaluate(model, testloader, criterion, CONFIG['device'])
@@ -219,22 +304,23 @@ for epoch in range(1, CONFIG['epochs'] + 1):
     history['lr'].append(current_lr)
     history['promotions'].append(cumulative_promotions)
     history['spike_events'].append(stats['spike_events'])
+    history['promotion_details'].append(promoted_details)
     
     best_marker = " *" if test_acc > best_acc else ""
     best_acc = max(best_acc, test_acc)
     
-    print(f"{epoch:5d} | {train_loss:10.4f} | {train_acc:8.2f}% | {test_acc:7.2f}% | {promotions:5d} ↑ | {stats['spike_events']:6d} | {stats['tier2_checks']:9d} | {vram:7.1f}M | {epoch_time:5.1f}s | {current_lr:.6f}{best_marker}")
+    print(f"{epoch:5d} | {train_loss:10.4f} | {train_acc:8.2f}% | {test_acc:7.2f}% | {promotions:5d} -> | {stats['spike_events']:6d} | {stats['tier2_checks']:9d} | {vram:7.1f}M | {epoch_time:5.1f}s | {current_lr:.6f}{best_marker}")
 
 print("=" * 105)
 print(f"Training Complete! Best Test Accuracy: {best_acc:.2f}%")
 print(f"Total layers promoted to TF32/FP32: {cumulative_promotions}")
 print(f"APA v2.0 Efficiency: {stats['sync_efficiency']}")
 '''
-    find_and_replace_cell(nb, 'Cell 10: Main Training Loop', main_source)
+    find_and_replace_cell(nb, 'Main Training Loop', main_source)
 
     # 6. Visualization
     viz_source = '''# ============================================================
-# Cell 11: Visualization (Termasuk Promotion Plot)
+# Cell 11: Visualization (Termasuk Promotion Plot & List)
 # ============================================================
 
 plt.style.use('ggplot')
@@ -271,8 +357,24 @@ ax4.set_ylabel('Number of Promoted Layers', fontsize=12)
 plt.tight_layout()
 plt.savefig('vgg16_tf32_fp8_results.png', dpi=150, bbox_inches='tight')
 plt.show()
+
+# --- Print Promotion History ---
+print("\\n" + "="*80)
+print("RIWAYAT PROMOSI TENSOR (FALLBACK KE TF32/FP32)")
+print("="*80)
+promotion_events = []
+for epoch_idx, epoch_proms in enumerate(history.get('promotion_details', [])):
+    epoch_num = epoch_idx + 1
+    for prom in epoch_proms:
+        print(f"Epoch {epoch_num:2d} | Group {prom['group_id']:3d} | Layer {prom['layer_name']:20s} | Type {prom['ttype']} | Index {prom['index']}")
+        promotion_events.append(prom)
+if not promotion_events:
+    print("Tidak ada tensor yang dipromosikan (training berjalan stabil dalam FP8).")
+print("="*80)
 '''
-    find_and_replace_cell(nb, 'Cell 11: Visualization (Termasuk Promotion Plot)', viz_source)
+    find_and_replace_cell(nb, 'Visualization', viz_source)
+
+    sanitize_notebook_unicode(nb)
 
     with open('vgg16_cifar10_tf32_fp8.ipynb', 'w', encoding='utf-8') as f:
         json.dump(nb, f, indent=1)
@@ -329,7 +431,7 @@ if torch.cuda.is_available():
     print(f"GPU Name       : {torch.cuda.get_device_name(0)}")
 print(f"FP8 Supported  : {check_fp8_support()}")
 '''
-    find_and_replace_cell(nb, 'Cell 2: Imports & Environment Check', imports_source)
+    find_and_replace_cell(nb, 'Cell 2: Imports', imports_source)
 
     # 2. Config
     config_source = '''# ============================================================
@@ -379,9 +481,9 @@ for k, v in CONFIG.items():
 # ============================================================
 
 # APA v2.0 — imported via ext3.nn imports cell above
-print("APA v2.0: assign_precision + APAStabilityMonitor imported ✓")
+print("APA v2.0: assign_precision + APAStabilityMonitor imported [OK]")
 '''
-    find_and_replace_cell(nb, 'Cell 5: Precision Assignment Setup', setup_source)
+    find_and_replace_cell(nb, 'Cell 5: Precision Assignment', setup_source)
 
     # 4. Train Epoch (with Promotion and GradScaler)
     train_source = '''# ============================================================
@@ -399,18 +501,22 @@ def train_epoch(model, loader, criterion, optimizer, scaler, device, monitor):
         
         optimizer.zero_grad()
         
-        with autocast(dtype=torch.float16):
+        if scaler is not None:
+            with autocast(dtype=torch.float16):
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scale_before = scaler.get_scale()
+            scaler.update()
+            scale_after = scaler.get_scale()
+            if scale_after < scale_before:
+                total_grad_overflows += 1
+        else:
             outputs = model(inputs)
             loss = criterion(outputs, targets)
-        
-        scaler.scale(loss).backward()
-        
-        scaler.step(optimizer)
-        scale_before = scaler.get_scale()
-        scaler.update()
-        scale_after = scaler.get_scale()
-        if scale_after < scale_before:
-            total_grad_overflows += 1
+            loss.backward()
+            optimizer.step()
         
         # --- APA v2.0: EMA-Gated Stability Monitor ---
         # Reuse loss.item() for both logging AND monitoring (zero extra sync)
@@ -429,16 +535,74 @@ def train_epoch(model, loader, criterion, optimizer, scaler, device, monitor):
         total += targets.size(0)
         correct += predicted.eq(targets).sum().item()
         
+    # Map promotions
     flags = EModlObjMgr.get_inc_ts_prec_flag()
-    total_promotions = sum([1 for f in flags if f > 0.0])
+    promoted_details = []
+    if len(flags) > 0 and sum(flags) > 0:
+        cnt = -1
+        mapping = {}
+        from ext3.core.include.ttype import Ttype
+        for ttype in (Ttype.P, Ttype.Y):
+            for emodl in EModlObjMgr.get_emodls_sort():
+                if ttype in emodl.info_ts and hasattr(emodl.info_ts[ttype], 'undovr'):
+                    for tsind, _ in enumerate(emodl.info_ts[ttype].undovr):
+                        cnt += 1
+                        mapping[cnt] = (ttype, emodl, tsind)
+        for idx, f in enumerate(flags):
+            if f > 0.0:
+                tt = mapping.get(idx)
+                if tt:
+                    ttype, emodl, tsind = tt
+                    gid = emodl.info_mdcur.id['grp_all'].val
+                    promoted_details.append({
+                        'group_id': gid,
+                        'layer_name': type(emodl).__name__,
+                        'ttype': 'Parameter' if ttype == Ttype.P else 'Activation',
+                        'index': tsind
+                    })
+    
+    total_promotions = len(promoted_details)
+    avg_loss = total_loss / total
+    accuracy = 100.0 * correct / total
+    return avg_loss, accuracy, total_promotions, total_grad_overflows, promoted_details, epoch_events
+
+print("train_epoch() defined [OK] [APA v2.0: GradScaler + EMA-Gated]")
+'''
+    find_and_replace_cell(nb, 'Cell 8: Training Function', train_source)
+
+    # 4b. Evaluate Function (CPU-compatible)
+    eval_source = '''# ============================================================
+# Cell 9: Evaluation Function
+# ============================================================
+
+@torch.no_grad()
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    total_loss, correct, total = 0.0, 0, 0
+    
+    for inputs, targets in loader:
+        inputs, targets = inputs.to(device), targets.to(device)
+        
+        if device == 'cuda':
+            with torch.cuda.amp.autocast(dtype=torch.float16):
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+        else:
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+        
+        total_loss += loss.item() * inputs.size(0)
+        _, predicted = outputs.max(1)
+        total += targets.size(0)
+        correct += predicted.eq(targets).sum().item()
     
     avg_loss = total_loss / total
     accuracy = 100.0 * correct / total
-    return avg_loss, accuracy, total_promotions, total_grad_overflows, epoch_events
+    return avg_loss, accuracy
 
-print("train_epoch() defined ✓ [APA v2.0: GradScaler + EMA-Gated]")
+print("evaluate() defined [OK]")
 '''
-    find_and_replace_cell(nb, 'Cell 8: Training Function (with GradScaler)', train_source)
+    find_and_replace_cell(nb, 'Cell 9: Evaluation Function', eval_source)
 
     # 5. Main Loop
     main_source = '''# ============================================================
@@ -450,6 +614,54 @@ model = VGG16Native(num_classes=10).to(CONFIG['device'])
 reset_fp8_manager()
 pasn_manager = assign_precision(model, CONFIG)
 
+# --- Grouping & Demotion Analysis ---
+group_stats = {}
+total_params_all = 0
+total_params_fp8 = 0
+
+for emodl in EModlObjMgr.get_emodls_sort():
+    gid = emodl.info_mdcur.id['grp_all'].val
+    if gid not in group_stats:
+        group_stats[gid] = {
+            'layers': [],
+            'params': 0,
+            'mode_y': 'unknown',
+            'mode_p': 'unknown'
+        }
+    
+    n_params = sum(p.numel() for p in emodl.parameters())
+    total_params_all += n_params
+    group_stats[gid]['params'] += n_params
+    group_stats[gid]['layers'].append(type(emodl).__name__)
+    
+    dtype_y = (emodl.info_ts[Ttype.Y].dtype[0]
+               if hasattr(emodl.info_ts[Ttype.Y], 'dtype')
+               and len(emodl.info_ts[Ttype.Y].dtype) > 0
+               else FP16)
+    dtype_p = (emodl.info_ts[Ttype.P].dtype[0]
+               if hasattr(emodl.info_ts[Ttype.P], 'dtype')
+               and len(emodl.info_ts[Ttype.P].dtype) > 0
+               else FP16)
+    mode_y = dtype_y.to_native().mode_name
+    mode_p = dtype_p.to_native().mode_name
+    group_stats[gid]['mode_y'] = mode_y
+    group_stats[gid]['mode_p'] = mode_p
+    
+    if mode_p == 'low_fp8':
+        total_params_fp8 += n_params
+
+print("\\n" + "="*80)
+print("ANALISIS TENSOR GROUPING & DEMOTION")
+print("="*80)
+print(f"Total Parameter Model: {total_params_all:,}")
+print(f"Total Parameter FP8  : {total_params_fp8:,} ({total_params_fp8/total_params_all*100:.2f}%)")
+print("-"*80)
+print(f"{'Group ID':<10} | {'Jumlah Layer':<12} | {'Total Params':<15} | {'Activation (Y)':<15} | {'Parameter (P)':<15}")
+print("-"*80)
+for gid, stats in sorted(group_stats.items()):
+    print(f"{gid:<10d} | {len(stats['layers']):<12d} | {stats['params']:<15,d} | {stats['mode_y']:<15s} | {stats['mode_p']:<15s}")
+print("="*80)
+
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.SGD(model.parameters(), lr=CONFIG['lr'], 
                       momentum=CONFIG['momentum'], weight_decay=CONFIG['weight_decay'])
@@ -458,16 +670,16 @@ scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG['epochs
 scaler = GradScaler(
     init_scale=CONFIG['grad_scaler_init_scale'],
     growth_interval=CONFIG['grad_scaler_growth_interval']
-)
+) if CONFIG['device'] == 'cuda' else None
 
 # --- APA v2.0: Initialize EMA-Gated Stability Monitor ---
 monitor = APAStabilityMonitor(
-    ema_alpha=0.1,            # EMA smoothing (tunable: 0.05-0.3)
-    variance_threshold=2.0,   # Spike sensitivity in σ (tunable: 1.5-4.0)
+    ema_alpha=0.1,            # EMA smoothing (alpha)
+    variance_threshold=2.0,   # Spike sensitivity in sigma (sigma)
     ovr_thrs=0.0,             # Any overflow triggers promotion
     warmup_steps=10,          # EMA calibration period
 )
-print(f"APA v2.0 Monitor initialized: α={0.1}, σ_thresh={2.0}, warmup={10}")
+print(f"APA v2.0 Monitor initialized: alpha={0.1}, sigma_thresh={2.0}, warmup={10}")
 
 history = {
     'train_loss': [],
@@ -478,6 +690,7 @@ history = {
     'promotions': [],
     'grad_overflows': [],
     'spike_events': [],
+    'promotion_details': [],
 }
 
 print("\\n" + "=" * 120)
@@ -491,7 +704,7 @@ for epoch in range(1, CONFIG['epochs'] + 1):
     start_time = time.time()
     current_lr = optimizer.param_groups[0]['lr']
     
-    train_loss, train_acc, promotions, grad_overflows, events = train_epoch(
+    train_loss, train_acc, promotions, grad_overflows, promoted_details, events = train_epoch(
         model, trainloader, criterion, optimizer, scaler, CONFIG['device'], monitor
     )
     _, test_acc = evaluate(model, testloader, criterion, CONFIG['device'])
@@ -510,22 +723,23 @@ for epoch in range(1, CONFIG['epochs'] + 1):
     history['promotions'].append(cumulative_promotions)
     history['grad_overflows'].append(grad_overflows)
     history['spike_events'].append(stats['spike_events'])
+    history['promotion_details'].append(promoted_details)
     
     best_marker = " *" if test_acc > best_acc else ""
     best_acc = max(best_acc, test_acc)
     
-    print(f"{epoch:5d} | {train_loss:10.4f} | {train_acc:8.2f}% | {test_acc:7.2f}% | {promotions:5d} ↑ | {grad_overflows:8d} | {stats['spike_events']:6d} | {stats['tier2_checks']:9d} | {vram:7.1f}M | {epoch_time:5.1f}s | {current_lr:.6f}{best_marker}")
+    print(f"{epoch:5d} | {train_loss:10.4f} | {train_acc:8.2f}% | {test_acc:7.2f}% | {promotions:5d} -> | {grad_overflows:8d} | {stats['spike_events']:6d} | {stats['tier2_checks']:9d} | {vram:7.1f}M | {epoch_time:5.1f}s | {current_lr:.6f}{best_marker}")
 
 print("=" * 120)
 print(f"Training Complete! Best Test Accuracy: {best_acc:.2f}%")
 print(f"Total layers promoted to FP16: {cumulative_promotions}")
 print(f"APA v2.0 Efficiency: {stats['sync_efficiency']}")
 '''
-    find_and_replace_cell(nb, 'Cell 11: Main Training Loop', main_source)
+    find_and_replace_cell(nb, 'Main Training Loop', main_source)
 
     # 6. Visualization
     viz_source = '''# ============================================================
-# Cell 12: Visualization
+# Cell 12: Visualization (Termasuk Promotion Plot & List)
 # ============================================================
 
 plt.style.use('ggplot')
@@ -562,8 +776,24 @@ ax4.set_ylabel('Number of Promoted Layers', fontsize=12)
 plt.tight_layout()
 plt.savefig('vgg16_fp16_fp8_training_results.png', dpi=150, bbox_inches='tight')
 plt.show()
+
+# --- Print Promotion History ---
+print("\\n" + "="*80)
+print("RIWAYAT PROMOSI TENSOR (FALLBACK KE FP16)")
+print("="*80)
+promotion_events = []
+for epoch_idx, epoch_proms in enumerate(history.get('promotion_details', [])):
+    epoch_num = epoch_idx + 1
+    for prom in epoch_proms:
+        print(f"Epoch {epoch_num:2d} | Group {prom['group_id']:3d} | Layer {prom['layer_name']:20s} | Type {prom['ttype']} | Index {prom['index']}")
+        promotion_events.append(prom)
+if not promotion_events:
+    print("Tidak ada tensor yang dipromosikan (training berjalan stabil dalam FP8).")
+print("="*80)
 '''
-    find_and_replace_cell(nb, 'Cell 12: Visualization', viz_source)
+    find_and_replace_cell(nb, 'Visualization', viz_source)
+
+    sanitize_notebook_unicode(nb)
 
     with open('vgg16_cifar10_fp16_fp8.ipynb', 'w', encoding='utf-8') as f:
         json.dump(nb, f, indent=1)
