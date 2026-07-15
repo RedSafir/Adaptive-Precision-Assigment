@@ -2,14 +2,19 @@ import json
 import os
 import sys
 
+def find_and_replace_cell(nb, keyword, new_source):
+    for cell in nb['cells']:
+        if cell['cell_type'] == 'code' and keyword in ''.join(cell['source']):
+            cell['source'] = [line + '\n' for line in new_source.split('\n')][:-1]
+            return True
+    return False
+
 def rewrite_tf32_notebook():
     with open('vgg16_cifar10_tf32_fp8.ipynb', 'r', encoding='utf-8') as f:
         nb = json.load(f)
 
     # 1. Imports
-    for cell in nb['cells']:
-        if cell['cell_type'] == 'code' and 'torchvision' in ''.join(cell['source']):
-            source = '''# ============================================================
+    imports_source = '''# ============================================================
 # Cell 2: Imports & Environment Check
 # ============================================================
 
@@ -55,13 +60,10 @@ if torch.cuda.is_available():
     print(f"GPU Name       : {torch.cuda.get_device_name(0)}")
 print(f"FP8 Supported  : {check_fp8_support()}")
 '''
-            cell['source'] = [line + '\n' for line in source.split('\n')][:-1]
-            break
+    find_and_replace_cell(nb, 'Cell 2: Imports & Environment Check', imports_source)
 
     # 2. Config
-    for cell in nb['cells']:
-        if cell['cell_type'] == 'code' and 'CONFIG' in ''.join(cell['source']):
-            source = '''# ============================================================
+    config_source = '''# ============================================================
 # Cell 3: Global Configuration
 # ============================================================
 
@@ -86,34 +88,28 @@ print("\\n=== Training Configuration ===")
 for k, v in CONFIG.items():
     print(f"  {k:20s}: {v}")
 '''
-            cell['source'] = [line + '\n' for line in source.split('\n')][:-1]
-            break
+    find_and_replace_cell(nb, 'Cell 3: Global Configuration', config_source)
 
     # 2b. VGG16Native definition - replace torch.flatten with flatten from ext3.nn
     for cell in nb['cells']:
-        if cell['cell_type'] == 'code' and 'class VGG16Native' in ''.join(cell['source']):
+        if cell['cell_type'] == 'code' and 'Cell 4: VGG16 Model Definition' in ''.join(cell['source']):
             source = ''.join(cell['source'])
             source = source.replace('torch.flatten(x, 1)', 'flatten(x, 1)')
             cell['source'] = [line + '\n' for line in source.split('\n')][:-1]
             break
 
     # 3. Precision Assignment
-    for cell in nb['cells']:
-        if cell['cell_type'] == 'code' and 'assign_precision' in ''.join(cell['source']):
-            source = '''# ============================================================
+    setup_source = '''# ============================================================
 # Cell 5: Precision Assignment Setup
 # ============================================================
 
 # APA v2.0 — imported via ext3.nn imports cell above
 print("APA v2.0: assign_precision + APAStabilityMonitor imported ✓")
 '''
-            cell['source'] = [line + '\n' for line in source.split('\n')][:-1]
-            break
+    find_and_replace_cell(nb, 'Cell 5: Precision Assignment Setup', setup_source)
 
     # 4. Train Epoch (with Promotion)
-    for cell in nb['cells']:
-        if cell['cell_type'] == 'code' and 'train_epoch' in ''.join(cell['source']):
-            source = '''# ============================================================
+    train_source = '''# ============================================================
 # Cell 8: Training Function (APA v2.0 — EMA-Gated Monitor)
 # ============================================================
 
@@ -158,13 +154,10 @@ def train_epoch(model, loader, criterion, optimizer, device, monitor):
 
 print("train_epoch() defined ✓ [APA v2.0: EMA-Gated]")
 '''
-            cell['source'] = [line + '\n' for line in source.split('\n')][:-1]
-            break
+    find_and_replace_cell(nb, 'Cell 8: Training Function', train_source)
 
     # 5. Main Loop
-    for cell in nb['cells']:
-        if cell['cell_type'] == 'code' and 'epochs' in ''.join(cell['source']) and 'optimizer' in ''.join(cell['source']):
-            source = '''# ============================================================
+    main_source = '''# ============================================================
 # Cell 10: Main Training Loop (APA v2.0)
 # ============================================================
 
@@ -237,13 +230,10 @@ print(f"Training Complete! Best Test Accuracy: {best_acc:.2f}%")
 print(f"Total layers promoted to TF32/FP32: {cumulative_promotions}")
 print(f"APA v2.0 Efficiency: {stats['sync_efficiency']}")
 '''
-            cell['source'] = [line + '\n' for line in source.split('\n')][:-1]
-            break
+    find_and_replace_cell(nb, 'Cell 10: Main Training Loop', main_source)
 
     # 6. Visualization
-    for cell in nb['cells']:
-        if cell['cell_type'] == 'code' and 'plt.subplots' in ''.join(cell['source']):
-            source = '''# ============================================================
+    viz_source = '''# ============================================================
 # Cell 11: Visualization (Termasuk Promotion Plot)
 # ============================================================
 
@@ -282,8 +272,7 @@ plt.tight_layout()
 plt.savefig('vgg16_tf32_fp8_results.png', dpi=150, bbox_inches='tight')
 plt.show()
 '''
-            cell['source'] = [line + '\n' for line in source.split('\n')][:-1]
-            break
+    find_and_replace_cell(nb, 'Cell 11: Visualization (Termasuk Promotion Plot)', viz_source)
 
     with open('vgg16_cifar10_tf32_fp8.ipynb', 'w', encoding='utf-8') as f:
         json.dump(nb, f, indent=1)
@@ -292,12 +281,8 @@ def rewrite_fp16_notebook():
     with open('vgg16_cifar10_fp16_fp8.ipynb', 'r', encoding='utf-8') as f:
         nb = json.load(f)
 
-    # Note: Using similar logic as TF32 but with GradScaler and FP16 base dtype
-    
     # 1. Imports
-    for cell in nb['cells']:
-        if cell['cell_type'] == 'code' and 'torchvision' in ''.join(cell['source']):
-            source = '''# ============================================================
+    imports_source = '''# ============================================================
 # Cell 2: Imports & Environment Check
 # ============================================================
 
@@ -344,13 +329,10 @@ if torch.cuda.is_available():
     print(f"GPU Name       : {torch.cuda.get_device_name(0)}")
 print(f"FP8 Supported  : {check_fp8_support()}")
 '''
-            cell['source'] = [line + '\n' for line in source.split('\n')][:-1]
-            break
+    find_and_replace_cell(nb, 'Cell 2: Imports & Environment Check', imports_source)
 
     # 2. Config
-    for cell in nb['cells']:
-        if cell['cell_type'] == 'code' and 'CONFIG' in ''.join(cell['source']):
-            source = '''# ============================================================
+    config_source = '''# ============================================================
 # Cell 3: Global Configuration
 # ============================================================
 
@@ -381,34 +363,28 @@ print("\\n=== Training Configuration ===")
 for k, v in CONFIG.items():
     print(f"  {k:20s}: {v}")
 '''
-            cell['source'] = [line + '\n' for line in source.split('\n')][:-1]
-            break
+    find_and_replace_cell(nb, 'Cell 3: Global Configuration', config_source)
 
     # 2b. VGG16Native definition - replace torch.flatten with flatten from ext3.nn
     for cell in nb['cells']:
-        if cell['cell_type'] == 'code' and 'class VGG16Native' in ''.join(cell['source']):
+        if cell['cell_type'] == 'code' and 'Cell 4: VGG16 Model Definition' in ''.join(cell['source']):
             source = ''.join(cell['source'])
             source = source.replace('torch.flatten(x, 1)', 'flatten(x, 1)')
             cell['source'] = [line + '\n' for line in source.split('\n')][:-1]
             break
 
     # 3. Precision Assignment
-    for cell in nb['cells']:
-        if cell['cell_type'] == 'code' and 'assign_precision' in ''.join(cell['source']):
-            source = '''# ============================================================
+    setup_source = '''# ============================================================
 # Cell 5: Precision Assignment Setup
 # ============================================================
 
 # APA v2.0 — imported via ext3.nn imports cell above
 print("APA v2.0: assign_precision + APAStabilityMonitor imported ✓")
 '''
-            cell['source'] = [line + '\n' for line in source.split('\n')][:-1]
-            break
+    find_and_replace_cell(nb, 'Cell 5: Precision Assignment Setup', setup_source)
 
     # 4. Train Epoch (with Promotion and GradScaler)
-    for cell in nb['cells']:
-        if cell['cell_type'] == 'code' and 'train_epoch' in ''.join(cell['source']):
-            source = '''# ============================================================
+    train_source = '''# ============================================================
 # Cell 8: Training Function (APA v2.0 — GradScaler + EMA-Gated Monitor)
 # ============================================================
 
@@ -462,13 +438,10 @@ def train_epoch(model, loader, criterion, optimizer, scaler, device, monitor):
 
 print("train_epoch() defined ✓ [APA v2.0: GradScaler + EMA-Gated]")
 '''
-            cell['source'] = [line + '\n' for line in source.split('\n')][:-1]
-            break
-            
+    find_and_replace_cell(nb, 'Cell 8: Training Function (with GradScaler)', train_source)
+
     # 5. Main Loop
-    for cell in nb['cells']:
-        if cell['cell_type'] == 'code' and 'epochs' in ''.join(cell['source']) and 'optimizer' in ''.join(cell['source']):
-            source = '''# ============================================================
+    main_source = '''# ============================================================
 # Cell 11: Main Training Loop (APA v2.0)
 # ============================================================
 
@@ -548,13 +521,10 @@ print(f"Training Complete! Best Test Accuracy: {best_acc:.2f}%")
 print(f"Total layers promoted to FP16: {cumulative_promotions}")
 print(f"APA v2.0 Efficiency: {stats['sync_efficiency']}")
 '''
-            cell['source'] = [line + '\n' for line in source.split('\n')][:-1]
-            break
+    find_and_replace_cell(nb, 'Cell 11: Main Training Loop', main_source)
 
     # 6. Visualization
-    for cell in nb['cells']:
-        if cell['cell_type'] == 'code' and 'plt.subplots' in ''.join(cell['source']):
-            source = '''# ============================================================
+    viz_source = '''# ============================================================
 # Cell 12: Visualization
 # ============================================================
 
@@ -593,12 +563,12 @@ plt.tight_layout()
 plt.savefig('vgg16_fp16_fp8_training_results.png', dpi=150, bbox_inches='tight')
 plt.show()
 '''
-            cell['source'] = [line + '\n' for line in source.split('\n')][:-1]
-            break
+    find_and_replace_cell(nb, 'Cell 12: Visualization', viz_source)
 
     with open('vgg16_cifar10_fp16_fp8.ipynb', 'w', encoding='utf-8') as f:
         json.dump(nb, f, indent=1)
 
-rewrite_tf32_notebook()
-rewrite_fp16_notebook()
-print("Successfully rewrote both notebooks.")
+if __name__ == '__main__':
+    rewrite_tf32_notebook()
+    rewrite_fp16_notebook()
+    print("Successfully rewrote both notebooks.")
